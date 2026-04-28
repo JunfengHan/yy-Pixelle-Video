@@ -41,6 +41,7 @@ from loguru import logger
 from api.config import api_config
 from api.tasks import task_manager
 from api.dependencies import shutdown_pixelle_video
+from pixelle_video.services.llm_service import EMBEDDED_MODE_ENV, _is_embedded_mode
 
 # Import routers
 from api.routers import (
@@ -55,6 +56,47 @@ from api.routers import (
     resources_router,
     frame_router,
 )
+
+
+# ---------------------------------------------------------------------------
+# Embedded-mode plumbing
+# ---------------------------------------------------------------------------
+# When Pixelle is launched by yyvideoclaw, we want:
+#   1. A clear "[embedded]" prefix on every log line for cross-process triage.
+#   2. Loopback-only binding (defence-in-depth; requirement §6.5, §8.1).
+#   3. Standalone mode completely untouched so upstream users keep shipping.
+#
+# All three live here (not in `__main__`) so uvicorn launches started via
+# e.g. ``uvicorn api.app:app`` also pick them up.
+EMBEDDED_MODE = _is_embedded_mode()
+
+
+def _install_embedded_logging() -> None:
+    """Prefix every log record with "[embedded]" when running under yyvideoclaw.
+
+    Runs exactly once at import time; safe to no-op if loguru has already been
+    customised by the host (the patch is idempotent).
+    """
+    # ``extra`` is the recommended, non-destructive way to augment loguru.
+    # We replace the default sink with one that always carries the embedded
+    # tag, preserving the original formatting otherwise.
+    logger.remove()
+    logger.add(
+        sys.stderr,
+        format=(
+            "[embedded] <green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+            "<level>{level: <8}</level> | "
+            "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
+            "<level>{message}</level>"
+        ),
+        level="INFO",
+        enqueue=True,  # safe for multi-process / subprocess-redirected stderr
+    )
+
+
+if EMBEDDED_MODE:
+    _install_embedded_logging()
+    logger.info("Pixelle starting under yyvideoclaw embedded mode.")
 
 
 @asynccontextmanager
@@ -162,11 +204,33 @@ if __name__ == "__main__":
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Start Pixelle-Video API Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    # In embedded mode we force loopback regardless of what the caller passed,
+    # so the default is loopback-only; standalone users still get 0.0.0.0.
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1" if EMBEDDED_MODE else "0.0.0.0",
+        help="Host to bind to",
+    )
     parser.add_argument("--port", type=int, default=8000, help="Port to bind to")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload")
     
     args = parser.parse_args()
+
+    # Defence-in-depth: embedded mode MUST NEVER expose Pixelle beyond the
+    # host loopback interface. If the caller tried to override with anything
+    # else (e.g. a stale CLI invocation), we coerce back to 127.0.0.1 and
+    # emit a warning instead of silently honouring a dangerous bind.
+    if EMBEDDED_MODE and args.host not in {"127.0.0.1", "::1", "localhost"}:
+        logger.warning(
+            "Embedded mode rejected non-loopback host %r; coercing to 127.0.0.1",
+            args.host,
+        )
+        args.host = "127.0.0.1"
+    if EMBEDDED_MODE and args.reload:
+        # Reload mode spawns a second process that would not inherit the
+        # embedded env consistently; disable it to avoid duplicated servers.
+        logger.warning("Embedded mode disables --reload; ignoring the flag.")
+        args.reload = False
     
     # Print startup banner
     print(f"""

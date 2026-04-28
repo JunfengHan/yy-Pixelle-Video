@@ -6,16 +6,37 @@ project_name: Pixelle-Video
 
 # ==================== LLM Configuration ====================
 # Supports any OpenAI SDK compatible API
+#
+# `provider` selects the operating mode:
+#   - "openai"   : Call an OpenAI-compatible provider directly (legacy default).
+#   - "openclaw" : Route LLM traffic through a yyvideoclaw / OpenClaw Gateway's
+#                  OpenAI-compatible endpoint (/v1/chat/completions). In this
+#                  mode `agent` is sent as the `model` field and `model` is
+#                  forwarded as the `x-openclaw-model` HTTP header so users can
+#                  switch the underlying LLM without restarting Pixelle.
 llm:
+  provider: "openai"   # "openai" | "openclaw"
   api_key: ""
   base_url: ""
   model: ""
+  # Only used when provider == "openclaw". Agent target registered on the
+  # yyvideoclaw side; a transparent passthrough agent is recommended.
+  agent: "openclaw/llm-passthrough"
 
 # Popular presets:
 # Qwen Max:        base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"  model: "qwen-max"
 # OpenAI GPT-4o:   base_url: "https://api.openai.com/v1"                          model: "gpt-4o"
 # DeepSeek:        base_url: "https://api.deepseek.com"                           model: "deepseek-chat"
 # Ollama (Local):  base_url: "http://localhost:11434/v1"                          model: "llama3.2"
+#
+# --- OpenClaw / yyvideoclaw Gateway preset (provider: "openclaw") ---
+# provider:  "openclaw"
+# base_url:  "http://127.0.0.1:18789/v1"
+# api_key:   "<yyvideoclaw Gateway bearer token>"
+# agent:     "openclaw/llm-passthrough"
+# model:     "qwen/qwen-max"      # sent as x-openclaw-model; pick any backend model
+#                                  # configured in yyvideoclaw (qwen/qwen-max,
+#                                  # openai/gpt-4o-mini, anthropic/claude-haiku-4-5, ...)
 
 # ==================== ComfyUI Configuration ====================
 comfyui:

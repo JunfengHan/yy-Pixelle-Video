@@ -112,17 +112,29 @@ class ConfigManager:
             "api_key": self.config.llm.api_key,
             "base_url": self.config.llm.base_url,
             "model": self.config.llm.model,
+            "provider": self.config.llm.provider,
+            "agent": self.config.llm.agent,
         }
-    
-    def set_llm_config(self, api_key: str, base_url: str, model: str):
+
+    def set_llm_config(
+        self,
+        api_key: str,
+        base_url: str,
+        model: str,
+        provider: Optional[str] = None,
+        agent: Optional[str] = None,
+    ):
         """Set LLM configuration"""
-        self.update({
-            "llm": {
-                "api_key": api_key,
-                "base_url": base_url,
-                "model": model,
-            }
-        })
+        payload = {
+            "api_key": api_key,
+            "base_url": base_url,
+            "model": model,
+        }
+        if provider is not None:
+            payload["provider"] = provider
+        if agent is not None:
+            payload["agent"] = agent
+        self.update({"llm": payload})
     
     def get_comfyui_config(self) -> dict:
         """Get ComfyUI configuration as dict"""

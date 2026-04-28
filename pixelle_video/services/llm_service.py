@@ -28,6 +28,40 @@ from loguru import logger
 T = TypeVar("T", bound=BaseModel)
 
 
+# ---------------------------------------------------------------------------
+# Embedded-mode helpers
+# ---------------------------------------------------------------------------
+# yyvideoclaw launches Pixelle as a managed subprocess and injects per-process
+# credentials via environment variables (see integration plan §2 / §4).
+# Keeping this mapping at module scope makes it trivially mockable in tests.
+_OPENCLAW_ENV_MAP: dict = {
+    "provider": "PIXELLE_LLM_PROVIDER",
+    "base_url": "PIXELLE_OPENCLAW_BASE_URL",
+    "api_key": "PIXELLE_OPENCLAW_TOKEN",
+    "agent": "PIXELLE_OPENCLAW_AGENT",
+    "model": "PIXELLE_OPENCLAW_MODEL",
+}
+
+# Env flag name is re-used by api.app / health router; keep it as a single
+# source of truth.
+EMBEDDED_MODE_ENV = "PIXELLE_EMBEDDED_MODE"
+
+
+def _is_embedded_mode(env=None) -> bool:
+    """Return ``True`` iff ``PIXELLE_EMBEDDED_MODE`` is set to a truthy value.
+
+    Recognised truthy values: ``1``, ``true``, ``yes``, ``on`` (case-insensitive).
+    Everything else — including the variable being unset — is falsy. Passing an
+    explicit mapping (instead of relying on ``os.environ``) makes unit tests
+    hermetic.
+    """
+    import os as _os
+
+    source = env if env is not None else _os.environ
+    raw = source.get(EMBEDDED_MODE_ENV, "")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class LLMService:
     """
     LLM (Large Language Model) service
@@ -69,16 +103,58 @@ class LLMService:
     def _get_config_value(self, key: str, default=None):
         """
         Get config value dynamically from config_manager (supports hot reload)
-        
+
+        In embedded mode (``PIXELLE_EMBEDDED_MODE=1``), a curated set of
+        ``PIXELLE_OPENCLAW_*`` environment variables takes precedence over the
+        persisted YAML config so that yyvideoclaw can inject per-subprocess
+        credentials (ephemeral token, active default model, gateway URL)
+        without mutating any on-disk file. This matches the zero-config
+        guarantee in the integration plan (see requirements §2 / §4).
+
         Args:
-            key: Config key name
-            default: Default value if not found
-        
+            key: Config key name (``api_key`` / ``base_url`` / ``model`` /
+                ``provider`` / ``agent``).
+            default: Default value if not found.
+
         Returns:
-            Config value
+            Config value.
         """
+        import os
+
+        # Env overrides are only considered when yyvideoclaw has explicitly
+        # opted us into embedded mode; standalone Pixelle users keep the
+        # exact legacy behaviour (config file is the sole source of truth).
+        if _is_embedded_mode(os.environ):
+            env_override = _OPENCLAW_ENV_MAP.get(key)
+            if env_override is not None:
+                raw = os.environ.get(env_override)
+                if raw is not None and raw.strip():
+                    return raw
+
         from pixelle_video.config import config_manager
         return getattr(config_manager.config.llm, key, default)
+
+    def _resolve_request_context(self, model: Optional[str]) -> tuple[str, Optional[dict]]:
+        """
+        Resolve the OpenAI-SDK `model` field and any `extra_headers` the
+        request should carry, based on the current llm.provider setting.
+
+        - provider == "openclaw": route via yyvideoclaw Gateway. The OpenAI
+          `model` field carries the agent target (e.g. `openclaw/llm-passthrough`)
+          and the backend model is passed via the `x-openclaw-model` header so
+          users can switch LLMs without restarting Pixelle. When `model` is
+          unset we fall back to `qwen/qwen-max`.
+        - provider == "openai" (or anything else, for legacy configs): behave
+          exactly like the original direct-connect path.
+        """
+        provider = (self._get_config_value("provider", "openai") or "openai").strip().lower()
+        backend_model = (model or self._get_config_value("model") or "").strip()
+        if provider == "openclaw":
+            agent = (self._get_config_value("agent") or "openclaw/llm-passthrough").strip()
+            final_model = agent
+            header_value = backend_model or "qwen/qwen-max"
+            return final_model, {"x-openclaw-model": header_value}
+        return backend_model or "gpt-3.5-turbo", None
     
     def _create_client(
         self,
@@ -112,7 +188,20 @@ class LLMService:
         client_kwargs = {"api_key": final_api_key}
         if final_base_url:
             client_kwargs["base_url"] = final_base_url
-        
+
+        # Warn when OpenClaw Gateway is configured over non-loopback plain HTTP
+        if final_base_url and final_base_url.startswith("http://"):
+            _is_loopback = (
+                "127.0.0.1" in final_base_url
+                or "localhost" in final_base_url
+                or "::1" in final_base_url
+            )
+            if not _is_loopback:
+                logger.warning(
+                    f"LLM base_url uses plain http on a non-loopback host ({final_base_url}); "
+                    "recommend HTTPS or SSH tunnel / tailnet for gateway calls."
+                )
+
         return AsyncOpenAI(**client_kwargs)
     
     async def __call__(
@@ -161,15 +250,16 @@ class LLMService:
         """
         # Create client (new instance each time to support parameter overrides)
         client = self._create_client(api_key=api_key, base_url=base_url)
-        
-        # Get model (priority: parameter > config)
-        final_model = (
-            model
-            or self._get_config_value("model")
-            or "gpt-3.5-turbo"  # Default fallback
+
+        # Resolve request-level model + optional OpenClaw header override.
+        # When provider=="openclaw" the OpenAI `model` carries the agent target
+        # and the backend model is forwarded via x-openclaw-model header.
+        final_model, extra_headers = self._resolve_request_context(model)
+
+        logger.debug(
+            f"LLM call: model={final_model}, base_url={client.base_url}, "
+            f"response_type={response_type}, extra_headers={bool(extra_headers)}"
         )
-        
-        logger.debug(f"LLM call: model={final_model}, base_url={client.base_url}, response_type={response_type}")
         
         try:
             if response_type is not None:
@@ -181,25 +271,41 @@ class LLMService:
                     response_type=response_type,
                     temperature=temperature,
                     max_tokens=max_tokens,
+                    extra_headers=extra_headers,
                     **kwargs
                 )
             else:
                 # Standard text output mode
-                response = await client.chat.completions.create(
-                    model=final_model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    **kwargs
-                )
-                
+                create_kwargs = {
+                    "model": final_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    **kwargs,
+                }
+                if extra_headers:
+                    create_kwargs["extra_headers"] = extra_headers
+                response = await client.chat.completions.create(**create_kwargs)
+
                 result = response.choices[0].message.content
                 logger.debug(f"LLM response length: {len(result)} chars")
-                
+
                 return result
-        
+
         except Exception as e:
-            logger.error(f"LLM call error (model={final_model}, base_url={client.base_url}): {e}")
+            # Expose gateway-friendly diagnostics when OpenClaw mode is enabled.
+            _diag = ""
+            if extra_headers and "x-openclaw-model" in extra_headers:
+                _api_key = self._get_config_value("api_key", "") or ""
+                _prefix = _api_key[:4] if _api_key else "<empty>"
+                _diag = (
+                    f" [OpenClaw mode: gateway={client.base_url}, token_prefix={_prefix}, "
+                    f"backend_model={extra_headers.get('x-openclaw-model')}; verify Gateway "
+                    f"/v1/chat/completions is reachable]"
+                )
+            logger.error(
+                f"LLM call error (model={final_model}, base_url={client.base_url}): {e}{_diag}"
+            )
             raise
     
     async def _call_with_structured_output(
@@ -210,6 +316,7 @@ class LLMService:
         response_type: Type[T],
         temperature: float,
         max_tokens: int,
+        extra_headers: Optional[dict] = None,
         **kwargs
     ) -> T:
         """
@@ -235,13 +342,16 @@ class LLMService:
         enhanced_prompt = f"{prompt}\n\n{json_schema_instruction}"
         
         # Call LLM with enhanced prompt
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": enhanced_prompt}],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            **kwargs
-        )
+        create_kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": enhanced_prompt}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            **kwargs,
+        }
+        if extra_headers:
+            create_kwargs["extra_headers"] = extra_headers
+        response = await client.chat.completions.create(**create_kwargs)
         content = response.choices[0].message.content
         
         logger.debug(f"Structured output response length: {len(content)} chars")

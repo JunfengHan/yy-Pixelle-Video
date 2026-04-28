@@ -37,170 +37,302 @@ def render_advanced_settings():
         with llm_col:
             with st.container(border=True):
                 st.markdown(f"**{tr('settings.llm.title')}**")
-                
-                # Quick preset selection
-                from pixelle_video.llm_presets import get_preset_names, get_preset, find_preset_by_base_url_and_model
-                
-                # Custom at the end
-                preset_names = get_preset_names() + ["Custom"]
-                
-                # Get current config
+
+                # Provider-mode switch (OpenClaw gateway vs direct).
                 current_llm = config_manager.get_llm_config()
-                
-                # Auto-detect which preset matches current config
-                current_preset = find_preset_by_base_url_and_model(
-                    current_llm["base_url"], 
-                    current_llm["model"]
+                _current_provider = (current_llm.get("provider") or "openai").strip().lower()
+
+                PROVIDER_MODE_DIRECT = tr("settings.llm.mode_direct")
+                PROVIDER_MODE_OPENCLAW = tr("settings.llm.mode_openclaw")
+                provider_mode = st.radio(
+                    tr("settings.llm.mode_label"),
+                    options=[PROVIDER_MODE_DIRECT, PROVIDER_MODE_OPENCLAW],
+                    index=1 if _current_provider == "openclaw" else 0,
+                    horizontal=True,
+                    key="llm_provider_mode",
+                    help=tr("settings.llm.mode_help"),
                 )
-                
-                # Determine default index based on current config
-                if current_preset:
-                    # Current config matches a preset
-                    default_index = preset_names.index(current_preset)
-                else:
-                    # Current config doesn't match any preset -> Custom
-                    default_index = len(preset_names) - 1
-                
-                selected_preset = st.selectbox(
-                    tr("settings.llm.quick_select"),
-                    options=preset_names,
-                    index=default_index,
-                    help=tr("settings.llm.quick_select_help"),
-                    key="llm_preset_select"
-                )
-                
-                # Auto-fill based on selected preset
-                if selected_preset != "Custom":
-                    # Preset selected
-                    preset_config = get_preset(selected_preset)
-                    
-                    # If user switched to a different preset (not current one), clear API key
-                    # If it's the same as current config, keep API key
-                    if selected_preset == current_preset:
-                        # Same preset as saved config: keep API key
-                        default_api_key = current_llm["api_key"]
+                is_openclaw_mode = provider_mode == PROVIDER_MODE_OPENCLAW
+
+                # Variables consumed by the save block at the bottom. The two
+                # branches below populate them consistently so the save path
+                # stays a single codepath.
+                llm_provider_value = "openclaw" if is_openclaw_mode else "openai"
+                llm_agent_value = current_llm.get("agent") or "openclaw/llm-passthrough"
+
+                if is_openclaw_mode:
+                    # ============================================================
+                    # OpenClaw / yyvideoclaw Gateway mode
+                    # ============================================================
+                    from pixelle_video.config.openclaw_models import load_openclaw_models
+
+                    default_backend_id, whitelist = load_openclaw_models()
+
+                    default_gateway_url = (
+                        current_llm.get("base_url") or "http://127.0.0.1:18789/v1"
+                    )
+                    default_api_key = current_llm.get("api_key") or ""
+                    default_backend_model = (
+                        current_llm.get("model") or default_backend_id
+                    )
+
+                    llm_base_url = st.text_input(
+                        f"{tr('settings.llm.openclaw_gateway_url')} *",
+                        value=default_gateway_url,
+                        help=tr("settings.llm.openclaw_gateway_url_help"),
+                        key="llm_openclaw_base_url",
+                    )
+                    llm_api_key = st.text_input(
+                        f"{tr('settings.llm.openclaw_api_key')} *",
+                        value=default_api_key,
+                        type="password",
+                        help=tr("settings.llm.openclaw_api_key_help"),
+                        key="llm_openclaw_api_key",
+                    )
+
+                    CUSTOM_OPTION = f"✏️ {tr('settings.llm.custom_model')}"
+                    whitelist_ids = [model_id for model_id, _label in whitelist]
+                    option_labels = [f"{lbl} — `{mid}`" for mid, lbl in whitelist] + [CUSTOM_OPTION]
+                    if default_backend_model in whitelist_ids:
+                        default_option_index = whitelist_ids.index(default_backend_model)
                     else:
-                        # Different preset: use default_api_key if provided (e.g., Ollama), otherwise clear
-                        default_api_key = preset_config.get("default_api_key", "")
-                    
-                    default_base_url = preset_config.get("base_url", "")
-                    default_model = preset_config.get("model", "")
-                    
-                    # Show API key URL if available
-                    if preset_config.get("api_key_url"):
-                        st.markdown(f"🔑 [{tr('settings.llm.get_api_key')}]({preset_config['api_key_url']})")
-                else:
-                    # Custom: show current saved config (if any)
-                    default_api_key = current_llm["api_key"]
-                    default_base_url = current_llm["base_url"]
-                    default_model = current_llm["model"]
-                
-                st.markdown("---")
-                
-                # API Key (use unique key to force refresh when switching preset)
-                llm_api_key = st.text_input(
-                    f"{tr('settings.llm.api_key')} *",
-                    value=default_api_key,
-                    type="password",
-                    help=tr("settings.llm.api_key_help"),
-                    key=f"llm_api_key_input_{selected_preset}"
-                )
-                
-                # Base URL (use unique key based on preset to force refresh)
-                llm_base_url = st.text_input(
-                    f"{tr('settings.llm.base_url')} *",
-                    value=default_base_url,
-                    help=tr("settings.llm.base_url_help"),
-                    key=f"llm_base_url_input_{selected_preset}"
-                )
-                
-                # Model selection with dropdown and load button
-                # Initialize session state for loaded models
-                if "llm_loaded_models" not in st.session_state:
-                    st.session_state.llm_loaded_models = []
-                
-                # Build model options: Custom option + loaded models
-                CUSTOM_MODEL_OPTION = f"✏️ {tr('settings.llm.custom_model')}"
-                model_options = [CUSTOM_MODEL_OPTION] + st.session_state.llm_loaded_models
-                
-                # Determine default selection
-                if default_model in st.session_state.llm_loaded_models:
-                    default_model_index = model_options.index(default_model)
-                else:
-                    # Default model not in loaded list, use custom
-                    default_model_index = 0
-                
-                # Model dropdown with load button on the right
-                model_col, load_col, test_col = st.columns([3, 1, 1])
-                
-                with model_col:
-                    selected_model_option = st.selectbox(
-                        f"{tr('settings.llm.model')} *",
-                        options=model_options,
-                        index=default_model_index,
-                        help=tr("settings.llm.model_help"),
-                        key=f"llm_model_select_{selected_preset}"
-                    )
-                
-                with load_col:
-                    st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-                    load_clicked = st.button(
-                        f"🔄 {tr('settings.llm.load_models')}",
-                        help=tr("settings.llm.load_models_help"),
-                        key="load_models_btn",
-                        use_container_width=True
-                    )
-                
-                with test_col:
-                    st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-                    test_clicked = st.button(
-                        f"🔌 {tr('settings.llm.test_connection')}",
-                        help=tr("settings.llm.test_connection_help"),
-                        key="test_llm_connection_btn",
-                        use_container_width=True
-                    )
-                
-                # Handle load models button click
-                if load_clicked:
-                    if llm_api_key and llm_base_url:
-                        try:
-                            from pixelle_video.utils.llm_util import fetch_available_models
-                            with st.spinner(tr("settings.llm.loading_models")):
-                                models = fetch_available_models(llm_api_key, llm_base_url)
-                                st.session_state.llm_loaded_models = models
-                                st.success(tr("settings.llm.models_loaded").replace("{count}", str(len(models))))
-                                safe_rerun()
-                        except Exception as e:
-                            st.error(tr("settings.llm.models_load_failed").replace("{error}", str(e)))
+                        default_option_index = len(option_labels) - 1
+
+                    model_col, test_col = st.columns([3, 1])
+                    with model_col:
+                        selected_option_label = st.selectbox(
+                            f"{tr('settings.llm.openclaw_backend_model')} *",
+                            options=option_labels,
+                            index=default_option_index,
+                            help=tr("settings.llm.openclaw_backend_model_help"),
+                            key="llm_openclaw_model_select",
+                        )
+                    with test_col:
+                        st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+                        openclaw_test_clicked = st.button(
+                            f"🔌 {tr('settings.llm.test_connection')}",
+                            help=tr("settings.llm.test_connection_help"),
+                            key="test_openclaw_connection_btn",
+                            use_container_width=True,
+                        )
+
+                    if selected_option_label == CUSTOM_OPTION:
+                        llm_model = st.text_input(
+                            tr("settings.llm.custom_model_input"),
+                            value=default_backend_model,
+                            help=tr("settings.llm.openclaw_custom_model_help"),
+                            key="llm_openclaw_custom_model",
+                        )
                     else:
-                        st.warning(tr("status.llm_config_incomplete"))
-                
-                # Handle test connection button click
-                if test_clicked:
-                    if llm_api_key and llm_base_url:
-                        try:
-                            from pixelle_video.utils.llm_util import test_llm_connection
-                            with st.spinner(tr("settings.llm.loading_models")):
-                                success, message, model_count = test_llm_connection(llm_api_key, llm_base_url)
-                                if success:
-                                    st.success(tr("settings.llm.connection_success").replace("{count}", str(model_count)))
+                        # Option label is "Label — `id`"; recover the id via index.
+                        selected_index = option_labels.index(selected_option_label)
+                        llm_model = whitelist_ids[selected_index]
+
+                    if openclaw_test_clicked:
+                        if not (llm_api_key and llm_base_url):
+                            st.warning(tr("status.llm_config_incomplete"))
+                        else:
+                            try:
+                                import httpx
+
+                                ping_url = llm_base_url.rstrip("/") + "/chat/completions"
+                                headers = {
+                                    "Authorization": f"Bearer {llm_api_key}",
+                                    "Content-Type": "application/json",
+                                    "x-openclaw-model": llm_model,
+                                }
+                                body = {
+                                    "model": llm_agent_value,
+                                    "messages": [{"role": "user", "content": "ping"}],
+                                    "max_tokens": 5,
+                                }
+                                with st.spinner(tr("settings.llm.loading_models")):
+                                    resp = httpx.post(
+                                        ping_url, headers=headers, json=body, timeout=15.0
+                                    )
+                                if resp.status_code == 200:
+                                    st.success(
+                                        tr("settings.llm.connection_success").replace(
+                                            "{count}", str(0)
+                                        )
+                                    )
                                 else:
-                                    st.error(tr("settings.llm.connection_failed").replace("{error}", message))
-                        except Exception as e:
-                            st.error(tr("settings.llm.connection_failed").replace("{error}", str(e)))
-                    else:
-                        st.warning(tr("status.llm_config_incomplete"))
-                
-                # If custom option selected, show text input for custom model name
-                if selected_model_option == CUSTOM_MODEL_OPTION:
-                    llm_model = st.text_input(
-                        tr("settings.llm.custom_model_input"),
-                        value=default_model,
-                        help=tr("settings.llm.model_help"),
-                        key=f"llm_custom_model_input_{selected_preset}"
-                    )
+                                    err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                                    st.error(
+                                        tr("settings.llm.connection_failed").replace(
+                                            "{error}", err
+                                        )
+                                    )
+                            except Exception as exc:  # noqa: BLE001
+                                st.error(
+                                    tr("settings.llm.connection_failed").replace(
+                                        "{error}", str(exc)
+                                    )
+                                )
                 else:
-                    llm_model = selected_model_option
+                    # ============================================================
+                    # Direct (legacy) mode — unchanged behavior
+                    # ============================================================
+                    # Quick preset selection
+                    from pixelle_video.llm_presets import get_preset_names, get_preset, find_preset_by_base_url_and_model
+                    
+                    # Custom at the end
+                    preset_names = get_preset_names() + ["Custom"]
+                    
+                    # Auto-detect which preset matches current config
+                    current_preset = find_preset_by_base_url_and_model(
+                        current_llm["base_url"], 
+                        current_llm["model"]
+                    )
+                    
+                    # Determine default index based on current config
+                    if current_preset:
+                        # Current config matches a preset
+                        default_index = preset_names.index(current_preset)
+                    else:
+                        # Current config doesn't match any preset -> Custom
+                        default_index = len(preset_names) - 1
+                    
+                    selected_preset = st.selectbox(
+                        tr("settings.llm.quick_select"),
+                        options=preset_names,
+                        index=default_index,
+                        help=tr("settings.llm.quick_select_help"),
+                        key="llm_preset_select"
+                    )
+                    
+                    # Auto-fill based on selected preset
+                    if selected_preset != "Custom":
+                        # Preset selected
+                        preset_config = get_preset(selected_preset)
+                        
+                        # If user switched to a different preset (not current one), clear API key
+                        # If it's the same as current config, keep API key
+                        if selected_preset == current_preset:
+                            # Same preset as saved config: keep API key
+                            default_api_key = current_llm["api_key"]
+                        else:
+                            # Different preset: use default_api_key if provided (e.g., Ollama), otherwise clear
+                            default_api_key = preset_config.get("default_api_key", "")
+                        
+                        default_base_url = preset_config.get("base_url", "")
+                        default_model = preset_config.get("model", "")
+                        
+                        # Show API key URL if available
+                        if preset_config.get("api_key_url"):
+                            st.markdown(f"🔑 [{tr('settings.llm.get_api_key')}]({preset_config['api_key_url']})")
+                    else:
+                        # Custom: show current saved config (if any)
+                        default_api_key = current_llm["api_key"]
+                        default_base_url = current_llm["base_url"]
+                        default_model = current_llm["model"]
+                    
+                    st.markdown("---")
+                    
+                    # API Key (use unique key to force refresh when switching preset)
+                    llm_api_key = st.text_input(
+                        f"{tr('settings.llm.api_key')} *",
+                        value=default_api_key,
+                        type="password",
+                        help=tr("settings.llm.api_key_help"),
+                        key=f"llm_api_key_input_{selected_preset}"
+                    )
+                    
+                    # Base URL (use unique key based on preset to force refresh)
+                    llm_base_url = st.text_input(
+                        f"{tr('settings.llm.base_url')} *",
+                        value=default_base_url,
+                        help=tr("settings.llm.base_url_help"),
+                        key=f"llm_base_url_input_{selected_preset}"
+                    )
+                    
+                    # Model selection with dropdown and load button
+                    # Initialize session state for loaded models
+                    if "llm_loaded_models" not in st.session_state:
+                        st.session_state.llm_loaded_models = []
+                    
+                    # Build model options: Custom option + loaded models
+                    CUSTOM_MODEL_OPTION = f"✏️ {tr('settings.llm.custom_model')}"
+                    model_options = [CUSTOM_MODEL_OPTION] + st.session_state.llm_loaded_models
+                    
+                    # Determine default selection
+                    if default_model in st.session_state.llm_loaded_models:
+                        default_model_index = model_options.index(default_model)
+                    else:
+                        # Default model not in loaded list, use custom
+                        default_model_index = 0
+                    
+                    # Model dropdown with load button on the right
+                    model_col, load_col, test_col = st.columns([3, 1, 1])
+                    
+                    with model_col:
+                        selected_model_option = st.selectbox(
+                            f"{tr('settings.llm.model')} *",
+                            options=model_options,
+                            index=default_model_index,
+                            help=tr("settings.llm.model_help"),
+                            key=f"llm_model_select_{selected_preset}"
+                        )
+                    
+                    with load_col:
+                        st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+                        load_clicked = st.button(
+                            f"🔄 {tr('settings.llm.load_models')}",
+                            help=tr("settings.llm.load_models_help"),
+                            key="load_models_btn",
+                            use_container_width=True
+                        )
+                    
+                    with test_col:
+                        st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+                        test_clicked = st.button(
+                            f"🔌 {tr('settings.llm.test_connection')}",
+                            help=tr("settings.llm.test_connection_help"),
+                            key="test_llm_connection_btn",
+                            use_container_width=True
+                        )
+                    
+                    # Handle load models button click
+                    if load_clicked:
+                        if llm_api_key and llm_base_url:
+                            try:
+                                from pixelle_video.utils.llm_util import fetch_available_models
+                                with st.spinner(tr("settings.llm.loading_models")):
+                                    models = fetch_available_models(llm_api_key, llm_base_url)
+                                    st.session_state.llm_loaded_models = models
+                                    st.success(tr("settings.llm.models_loaded").replace("{count}", str(len(models))))
+                                    safe_rerun()
+                            except Exception as e:
+                                st.error(tr("settings.llm.models_load_failed").replace("{error}", str(e)))
+                        else:
+                            st.warning(tr("status.llm_config_incomplete"))
+                    
+                    # Handle test connection button click
+                    if test_clicked:
+                        if llm_api_key and llm_base_url:
+                            try:
+                                from pixelle_video.utils.llm_util import test_llm_connection
+                                with st.spinner(tr("settings.llm.loading_models")):
+                                    success, message, model_count = test_llm_connection(llm_api_key, llm_base_url)
+                                    if success:
+                                        st.success(tr("settings.llm.connection_success").replace("{count}", str(model_count)))
+                                    else:
+                                        st.error(tr("settings.llm.connection_failed").replace("{error}", message))
+                            except Exception as e:
+                                st.error(tr("settings.llm.connection_failed").replace("{error}", str(e)))
+                        else:
+                            st.warning(tr("status.llm_config_incomplete"))
+                    
+                    # If custom option selected, show text input for custom model name
+                    if selected_model_option == CUSTOM_MODEL_OPTION:
+                        llm_model = st.text_input(
+                            tr("settings.llm.custom_model_input"),
+                            value=default_model,
+                            help=tr("settings.llm.model_help"),
+                            key=f"llm_custom_model_input_{selected_preset}"
+                        )
+                    else:
+                        llm_model = selected_model_option
         
         # ====================================================================
         # Column 2: ComfyUI Settings
@@ -299,12 +431,25 @@ def render_advanced_settings():
         with col1:
             if st.button(tr("btn.save_config"), use_container_width=True, key="save_config_btn"):
                 try:
-                    # Validate and save LLM configuration
-                    if not (llm_api_key and llm_base_url and llm_model):
+                    # Validate by mode: in OpenClaw mode `model` may be empty
+                    # (the service falls back to qwen/qwen-max); in direct mode
+                    # all three fields are required.
+                    if is_openclaw_mode:
+                        llm_config_valid = bool(llm_api_key and llm_base_url)
+                    else:
+                        llm_config_valid = bool(llm_api_key and llm_base_url and llm_model)
+
+                    if not llm_config_valid:
                         st.error(tr("status.llm_config_incomplete"))
                     else:
-                        config_manager.set_llm_config(llm_api_key, llm_base_url, llm_model)
-                    
+                        config_manager.set_llm_config(
+                            api_key=llm_api_key,
+                            base_url=llm_base_url,
+                            model=llm_model or "",
+                            provider=llm_provider_value,
+                            agent=llm_agent_value,
+                        )
+
                     # Save ComfyUI configuration (optional fields, always save what's provided)
                     # Convert checkbox to instance type: True -> "plus", False -> ""
                     instance_type = "plus" if runninghub_48g_enabled else ""
@@ -315,9 +460,9 @@ def render_advanced_settings():
                         runninghub_concurrent_limit=int(runninghub_concurrent_limit),
                         runninghub_instance_type=instance_type
                     )
-                    
+
                     # Only save to file if LLM config is valid
-                    if llm_api_key and llm_base_url and llm_model:
+                    if llm_config_valid:
                         config_manager.save()
                         st.success(tr("status.config_saved"))
                         safe_rerun()

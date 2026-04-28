@@ -1,0 +1,41 @@
+# yyvideoclaw / OpenClaw Gateway — Backend Model Whitelist
+#
+# Consumed by: web/components/settings.py (front-end model selector when
+# `llm.provider == "openclaw"`). Maintained as a separate YAML file so new
+# backend models can be added without touching Python code.
+#
+# Each entry is a `<provider>/<model-id>` string understood by the yyvideoclaw
+# Gateway's `x-openclaw-model` header. Users can also pick "Custom..." in the
+# UI to type any string matching the same format.
+#
+# Default backend model (used when a user first switches to the OpenClaw mode):
+default: "qwen/qwen-max"
+
+models:
+  # Alibaba / Qwen (via yyvideoclaw "alibaba" / "qwen" providers)
+  - id: "qwen/qwen-max"
+    label: "Qwen Max (default)"
+  - id: "qwen/qwen-plus"
+    label: "Qwen Plus"
+  - id: "qwen/qwen-turbo"
+    label: "Qwen Turbo"
+
+  # OpenAI
+  - id: "openai/gpt-4o-mini"
+    label: "OpenAI GPT-4o mini"
+  - id: "openai/gpt-4o"
+    label: "OpenAI GPT-4o"
+
+  # Anthropic Claude
+  - id: "anthropic/claude-haiku-4-5"
+    label: "Anthropic Claude Haiku 4.5"
+  - id: "anthropic/claude-sonnet-4-5"
+    label: "Anthropic Claude Sonnet 4.5"
+
+  # Google
+  - id: "google/gemini-2.5-flash"
+    label: "Google Gemini 2.5 Flash"
+
+  # Ollama (local)
+  - id: "ollama/qwen2.5"
+    label: "Ollama Qwen2.5 (local)"
